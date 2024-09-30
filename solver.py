@@ -88,6 +88,8 @@ total_dofs = A_space.dofmap.index_map.size_global * A_space.dofmap.index_map_bs
 A = TrialFunction(A_space)
 v = TestFunction(A_space)
 
+mu_R = fem.Constant(domain, default_scalar_type(1.0))
+sigma = fem.Constant(domain, default_scalar_type(1.0))
 
 def boundary_marker(x):
     """Marker function for the boundary of a unit cube"""
@@ -131,18 +133,17 @@ A_n = Function(A_space)
 A_expr = Expression(aex, A_space.element.interpolation_points())
 A_n.interpolate(A_expr)
 
-f = curl(curl(aex)) + diff(aex, t)
-f_prev = curl(curl(aex_prev)) + diff(aex_prev, t_n)
+f = (1 / mu_R)*curl(curl(aex)) + sigma*diff(aex, t)
+f_prev = (1 / mu_R)*curl(curl(aex_prev)) + sigma*diff(aex_prev, t_n)
 
 dx = Measure("dx", domain=domain)
 # Weak Form
-lhs = theta * dt * inner(curl(A), curl(v)) * dx + inner(A, v) * dx
+lhs = theta * dt * (1 / mu_R) * inner(curl(A), curl(v)) * dx + inner(A*sigma, v) * dx
 
-rhs1 = inner(A_n, v) * dx
-rhs2 = -(1 - theta) * dt * inner(curl(A_n), curl(v)) * dx
+rhs1 = inner(sigma*A_n, v) * dx
+rhs2 = -(1 - theta) * dt * (1 / mu_R)*inner(curl(A_n), curl(v)) * dx
 rhs3 = (1 - theta) * dt * inner(f_prev, v) * dx
 rhs4 = theta * dt * inner(f, v) * dx
-
 
 rhs = rhs1 + rhs2 + rhs3 + rhs4
 
