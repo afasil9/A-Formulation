@@ -1,174 +1,253 @@
-import numpy as np
+#%%
+import ufl
 from mpi4py import MPI
-from petsc4py import PETSc
-from ufl import (ds, dx, inner, grad, div, curl, SpatialCoordinate, 
-                 as_vector, sin, cos, pi, variable, TrialFunction, 
-                 TestFunction, Measure, diff)
-from dolfinx import fem, mesh, io, default_scalar_type
-from dolfinx.fem import (dirichletbc, assemble_scalar, form, Function, 
-                         Expression, locate_dofs_topological)
-from dolfinx.fem.petsc import (assemble_matrix, assemble_vector, apply_lifting, set_bc)
-from dolfinx.io import VTXWriter
-from basix.ufl import element
+from petsc4py.PETSc import ScalarType
+from ufl import ds, dx, grad, inner, curl
+from dolfinx import fem, io, mesh, plot, default_scalar_type
+from dolfinx.fem import dirichletbc
+from dolfinx.io import XDMFFile
 from ufl.core.expr import Expr
-from dolfinx.io import VTXWriter, XDMFFile, gmshio
-from dolfinx.mesh import locate_entities_boundary, create_unit_cube, transfer_meshtag, RefinementOption, refine_plaza, GhostMode
+from petsc4py import PETSc
+from ufl import SpatialCoordinate, as_vector, sin, pi, curl
+from dolfinx.fem import assemble_scalar, form, Function
+from matplotlib import pyplot as plt
+from dolfinx.fem.petsc import assemble_matrix
+from dolfinx.fem import petsc, Expression, locate_dofs_topological
+from dolfinx.io import VTXWriter
+from dolfinx.cpp.fem.petsc import (discrete_gradient,
+                                   interpolation_matrix)
+from basix.ufl import element
+from petsc4py import PETSc
+from mpi4py import MPI
+import numpy as np
+from basix.ufl import element
+from dolfinx import fem, io, la, default_scalar_type
+from dolfinx.cpp.fem.petsc import discrete_gradient, interpolation_matrix
+from dolfinx.fem import Function, form, locate_dofs_topological, petsc
+from ufl import (
+    Measure,
+    SpatialCoordinate,
+    TestFunction,
+    TrialFunction,
+    curl,
+    cos,
+    inner,
+    cross,
+)
+import ufl
+import sys
+from ufl import variable
+from scipy.linalg import norm
 
-iteration_count = []
-residual_norm = []
-
-ti = 0.0  # Start time
-T = 0.1  # End time
-num_steps = 200  # Number of time steps
-d_t = (T - ti) / num_steps  # Time step size
-
-n = 8
-degree = 1
-
-def L2_norm(v: Expr):
-    """Computes the L2-norm of v"""
-    return np.sqrt(MPI.COMM_WORLD.allreduce(
-        assemble_scalar(form(inner(v, v) * dx)), op=MPI.SUM))
 
 def monitor(ksp, its, rnorm):
         iteration_count.append(its)
         residual_norm.append(rnorm)
         print("Iteration: {}, preconditioned residual: {}".format(its, rnorm))
 
+comm = MPI.COMM_WORLD
+def par_print(comm, string):
+    if comm.rank == 0:
+        print(string)
+        sys.stdout.flush()
+
+def L2_norm(v: Expr):
+    """Computes the L2-norm of v
+    """
+    return np.sqrt(MPI.COMM_WORLD.allreduce(
+        assemble_scalar(form(inner(v, v) * dx)), op=MPI.SUM))
+
+degree = 1
+
+n = 4
+
+ti = 0.0  # Start time
+T = 0.1  # End time
+num_steps = 200  # Number of time steps
+d_t = (T - ti) / num_steps  # Time step size
+
 domain = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
+gdim = domain.geometry.dim
+facet_dim = gdim - 1 #Topological dimension 
 
 t = variable(fem.Constant(domain, ti))
 dt = fem.Constant(domain, d_t)
 
-# Should be topology dim
+alpha_in = 1.0 #Magnetic Permeability
+beta_in = 1.0 #Conductivity -> This is set to 0 for Magnetostatic problems
+
+nu = fem.Constant(domain, default_scalar_type(alpha_in))
+sigma = fem.Constant(domain, default_scalar_type(beta_in))
+
 gdim = domain.geometry.dim
-facet_dim = gdim - 1
+top_dim = gdim - 1 #Topological dimension 
 
-# Define function spaces
 nedelec_elem = element("N1curl", domain.basix_cell(), degree)
-A_space = fem.functionspace(domain, nedelec_elem)
+V = fem.functionspace(domain, nedelec_elem)
 
-total_dofs = A_space.dofmap.index_map.size_global * A_space.dofmap.index_map_bs
-
-
-# Magnetic Vector Potential
-A = TrialFunction(A_space)
-v = TestFunction(A_space)
-
-
-def boundary_marker(x):
-    """Marker function for the boundary of a unit cube"""
-    # Collect boundaries perpendicular to each coordinate axis
-    boundaries = [
-        np.logical_or(np.isclose(x[i], 0.0), np.isclose(x[i], 1.0))
-        for i in range(3)]
-    return np.logical_or(np.logical_or(boundaries[0],
-                                        boundaries[1]),
-                            boundaries[2])
-
-facets = mesh.locate_entities_boundary(domain, dim=facet_dim,
-                                        marker= boundary_marker)
-bdofs0 = fem.locate_dofs_topological(A_space, entity_dim=facet_dim, entities=facets)
-
-
-# Define Exact Solutions for Magnetic Vector Potential and Electric Scalar Potential
-
-def A_ex(x, t):
-    return as_vector((cos(pi * x[1]) * sin(pi * t), cos(pi * x[2]) * sin(pi * t), cos(pi * x[0]) * sin(pi * t)))
+# total_dofs = V.dofmap.index_map.size_global * V.dofmap.index_map_bs
+# print(total_dofs)
 
 x = SpatialCoordinate(domain)
-aex = A_ex(x, t)
 
-# Impose boundary conditions on the exact solution
-u_bc_expr_A = Expression(aex, A_space.element.interpolation_points())
-u_bc_A = Function(A_space)
-u_bc_A.interpolate(u_bc_expr_A)
-bc0_ex = dirichletbc(u_bc_A, bdofs0)
+def A_ex(x, t):
+    return as_vector((
+        x[1]**2 + x[0] * t, 
+        x[2]**2 + x[1] * t, 
+        x[0]**2 + x[2] * t))
 
-bc = bc0_ex
+x = SpatialCoordinate(domain)
 
-mu_R = fem.Constant(domain, default_scalar_type(1.0))
-sigma = fem.Constant(domain, default_scalar_type(1.0))
+uex = A_ex(x,t)
 
-# Weak Form
 
-a00 = dt * (1 / mu_R) * inner(curl(A), curl(v)) * dx
-a00 += inner((A*sigma), v) * dx 
+#Manually calculating the RHS
+
+f0 = as_vector((
+    -2 + x[0],
+    -2 + x[1],
+    -2 + x[2])
+)
+
+# Alternate using ufl
+# f0 = curl(curl(uex)) + sigma * ufl.diff(uex,t)
+
+u0  = ufl.TrialFunction(V)
+v0 = ufl.TestFunction(V)
+
+facets = mesh.locate_entities_boundary(domain, dim=(domain.topology.dim - 1),
+                                    marker=lambda x: np.isclose(x[0], 0.0)|np.isclose(x[0], 1.0)|np.isclose(x[1], 0.0)|np.isclose(x[1], 1.0)|
+                                        np.isclose(x[2], 0.0)|np.isclose(x[2], 1.0))
+dofs = fem.locate_dofs_topological(V=V, entity_dim=top_dim, entities=facets)
+
+
+# Initial conditions
+u_n = Function(V)
+u_expr = Expression(uex, V.element.interpolation_points())
+u_n.interpolate(u_expr)
+
+
+bdofs0 = fem.locate_dofs_topological(V, entity_dim=facet_dim, entities=facets)
+u_bc_expr_V = Expression(uex, V.element.interpolation_points())
+u_bc_V = Function(V)
+u_bc_V.interpolate(u_bc_expr_V)
+bc_ex = dirichletbc(u_bc_V, bdofs0)
+bc = bc_ex
+
+
+a00 = dt * nu * inner(curl(u0), curl(v0)) * dx
+a00 += inner((u0*sigma), v0) * dx 
 
 a = form(a00)
+
+L0 = dt* inner(f0, v0) *dx + sigma * inner(u_n, v0) * dx
+L = form(L0)
+# Solver steps
 
 A_mat = assemble_matrix(a, bcs = [bc])
 A_mat.assemble()
 
-# Need to interpolate if non-zero initially
-A_n = Function(A_space)
-
-j_e = (1 / mu_R) * curl(curl(aex)) + sigma*diff(aex,t)
-time_l0 = (sigma * A_n)
-f_time_l0 = dt * j_e + time_l0
-
-L0 = inner(f_time_l0,v) * dx
-
-L = form(L0)
-
-b = assemble_vector(L)
-apply_lifting(b, [a], bcs=[[bc]])
+b = petsc.assemble_vector(L)
+petsc.apply_lifting(b, [a], bcs=[[bc]])
 b.ghostUpdate(addv=PETSc.InsertMode.ADD,
                 mode=PETSc.ScatterMode.REVERSE)
-set_bc(b, [bc])
+petsc.set_bc(b, [bc])
 
-A_map = A_space.dofmap.index_map
 
 ksp = PETSc.KSP().create(domain.comm)
 ksp.setOperators(A_mat)
+ksp.setOptionsPrefix(f"ksp_{id(ksp)}")
+ksp.setTolerances(rtol=1e-10)
 ksp.setType("preonly")
 
 pc = ksp.getPC()
-pc.setType("lu")
-pc.setFactorSolverType("mumps")
+pc.setType("hypre")
+pc.setHYPREType("ams")
 
-opts = PETSc.Options()  # type: ignore
-opts["mat_mumps_icntl_14"] = 80  # Increase MUMPS working memory
-opts["mat_mumps_icntl_24"] = 1  # Option to support solving a singular matrix (pressure nullspace)
-opts["mat_mumps_icntl_25"] = 0  # Option to support solving a singular matrix (pressure nullspace)
-opts["ksp_error_if_not_converged"] = 1
+opts = PETSc.Options()
+opts[f"{pc.prefix}pc_hypre_ams_cycle_type"] = 7
+opts[f"{pc.prefix}pc_hypre_ams_tol"] = 0
+opts[f"{pc.prefix}pc_hypre_ams_max_iter"] = 1
+opts[f"{pc.prefix}pc_hypre_ams_amg_beta_theta"] = 0.25
+opts[f"{pc.prefix}pc_hypre_ams_print_level"] = 1
+opts[f"{pc.prefix}pc_hypre_ams_amg_alpha_options"] = "10,1,3"
+opts[f"{pc.prefix}pc_hypre_ams_amg_beta_options"] = "10,1,3"
+opts[f"{pc.prefix}pc_hypre_ams_print_level"] = 0
+
+
+# Build discrete gradient
+V_CG = fem.functionspace(domain, ("CG", degree))._cpp_object
+G = discrete_gradient(V_CG, V._cpp_object)
+G.assemble()
+pc.setHYPREDiscreteGradient(G)
+
+if degree == 1:
+    cvec_0 = Function(V)
+    cvec_0.interpolate(lambda x: np.vstack((np.ones_like(x[0]),
+                                            np.zeros_like(x[0]),
+                                            np.zeros_like(x[0]))))
+    cvec_1 = Function(V)
+    cvec_1.interpolate(lambda x: np.vstack((np.zeros_like(x[0]),
+                                            np.ones_like(x[0]),
+                                            np.zeros_like(x[0]))))
+    cvec_2 = Function(V)
+    cvec_2.interpolate(lambda x: np.vstack((np.zeros_like(x[0]),
+                                            np.zeros_like(x[0]),
+                                            np.ones_like(x[0]))))
+    pc.setHYPRESetEdgeConstantVectors(cvec_0.vector,
+                                        cvec_1.vector,
+                                        cvec_2.vector)
+else:
+    Vec_CG = fem.functionspace(domain, ("CG", degree, (domain.geometry.dim,)))
+    Pi = interpolation_matrix(Vec_CG._cpp_object, V._cpp_object)
+    Pi.assemble()
+
+    # Attach discrete gradient to preconditioner
+    pc.setHYPRESetInterpolations(domain.geometry.dim, None, None, Pi, None)
+
 ksp.setFromOptions()
 
-offset = A_space.dofmap.index_map.size_local * A_space.dofmap.index_map_bs
+ksp.setUp()
+pc.setUp()
 
-aerr = []
-res = []
+uh = fem.Function(V)
 
-X = fem.functionspace(domain, ("Discontinuous Lagrange", degree + 1, (domain.geometry.dim,)))
-A_vis = fem.Function(X)
-A_vis.interpolate(A_n)
+iteration_count = []
+residual_norm = []
 
-A_file = io.VTXWriter(domain.comm, "A.bp", A_vis, "BP4")
-A_file.write(t.expression().value)
+print("norm of bc", L2_norm(u_bc_V))
+print("norm of uex", L2_norm(uex))
+print("norm of u_n", L2_norm(u_n))
 
+# ksp.setMonitor(monitor)
+ksp.solve(b, uh.vector)
+res = A_mat * uh.vector - b
+# print("Residual norm: ", res.norm())
+u_n.x.array[:] = uh.x.array
+
+print("norm of u_n after solve", L2_norm(u_n))
+#%%
 for i in range(num_steps):  
     t.expression().value += d_t
 
-    u_bc_A.interpolate(u_bc_expr_A)
+    u_bc_V.interpolate(u_bc_expr_V)
 
-    b = assemble_vector(L)
-    apply_lifting(b, [a], bcs=[[bc]])
+    with b.localForm() as loc:
+        loc.set(0)
+
+    # print(L2_norm(uex - u_n))
+    
+    b = petsc.assemble_vector(L)
+    petsc.apply_lifting(b, [a], bcs=[[bc]])
     b.ghostUpdate(addv=PETSc.InsertMode.ADD,
                     mode=PETSc.ScatterMode.REVERSE)
-    set_bc(b, [bc])
+    petsc.set_bc(b, [bc])
 
-    # print(f"b norm = {b.norm()}")
-    sol = A_mat.createVecRight()
-    residual = A_mat * sol - b
-    res.append(residual.norm())
+    ksp.solve(b, uh.x.petsc_vec)
 
-    ksp.solve(b, sol)
+    u_n.x.array[:] = uh.x.array
 
-    A_n.x.array[:offset] = sol.array_r[:offset]
 
-    A_vis.interpolate(A_n)
-    A_file.write(t.expression().value)
-
-A_file.close()
-
-print(f"e_B  = {L2_norm(curl(A_n) - curl(aex))}")
+e = L2_norm(uh - uex)
+# par_print(comm, e)
+par_print(comm, f"||u - u_e||_L^2(Omega) = {e}")
